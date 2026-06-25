@@ -6,7 +6,7 @@ An autonomous research agent built on **LangGraph**. Give it a topic, and it pla
 
 ResearchMind runs a cyclic LangGraph state machine. Each node mutates a shared `ResearchState` and the graph keeps looping between searching and critiquing until the research is deep enough (or it hits the iteration cap for the requested depth).
 
-![ResearchMind architecture and flow](researchmind_architecture_flow.png)
+![ResearchMind architecture and flow](researchmind_architecture_flow.svg)
 
 ### Pipeline stages
 
