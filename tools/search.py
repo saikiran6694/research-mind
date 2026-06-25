@@ -2,7 +2,7 @@ from langchain.tools import tool
 from tavily import TavilyClient
 import os
 
-client = TavilyClient(api_key="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")
+client = TavilyClient(api_key="")
 
 @tool
 def web_search(query: str, max_results: int = 2) -> list[dict]:
