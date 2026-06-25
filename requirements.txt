@@ -1,0 +1,14 @@
+langchain
+langchain-anthropic
+langchain-google-genai
+langchain-community
+langchain-chroma
+langgraph
+chromadb
+tavily-python
+beautifulsoup4
+httpx
+pydantic
+python-dotenv
+rich
+tiktoken
