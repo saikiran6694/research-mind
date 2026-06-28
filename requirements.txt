@@ -4,6 +4,7 @@ langchain-google-genai
 langchain-community
 langchain-chroma
 langgraph
+langsmith
 chromadb
 tavily-python
 beautifulsoup4

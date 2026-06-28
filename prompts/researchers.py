@@ -1,62 +1,47 @@
-PLANNER_PROMPT = """You are a research planning expert.
+PLANNER_PROMPT = """You are a research planner. 
 
-Given a research topic and focus areas, generate a strategic set of search queries 
-that will comprehensively cover the topic from multiple areas.
+Generate exactly {n} precise, diverse web search queries for the topic below. Each query should cover a different angle.
 
 Topic: {topic}
 Focus areas: {focus_areas}
 Existing queries already run: {existing_queries}
 Knowledge gap identified so far: {knowledge_gaps}
 
-Generate 3-5 percise , diverse search queries that will fill gaps and deepen coverage.
-Return STRICTLY ONLY a JSON list of query strings. No explaination."""
+Return ONLY a JSON array of {n} query strings. No explanation. No markdown.
+Example: ["query one", "query two", "query three"]"""
 
 
-ANALYZER_PROMPT = """You are a rigorous research analyst.
+ANALYZER_CRITIQUE_PROMPT = """You are a research analyst and critic. Analyse all sources below in ONE pass.
 
-Analyse the following source content and extract key findings relevant to the research topic.
+TOPIC: {topic}
+FOCUS AREAS: {focus_areas}
 
-Topic: {topic}
-Source URL: {url}
-Source Title: {title}
-Content: 
-{content}
-
-Previously retireved context from the knowledge base
+PRIOR KNOWLEDGE BASE CONTEXT:
 {kb_context}
 
-Extract:
-1. Key claims with direct evidence from the text.
-2. Any contradictions with prior findings (if any).
-3. Confidence level (0.0-1.0) for each claim.
-4. Relevance Score (0.0-1.0) for this source.
+SOURCES
+{sources_block}
 
-Return as JSON matching this schema:
-{{
-  "findings": [{{"claim": str, "evidence": [str], "confidence": float, "contradictions": [str]}}],
-  "relevance_score": float,
-  "key_quotes": [str]
-}}"""
-
-
-CRITIQUE_PROMPT = """You are a critical research reviewer.
-
-Review the following set of findings and identify:
-1. Logical inconsistency or contradictions between sources.
-2. Claims that needs stronger evidence.
-3. Important prespective or viewpoints that are missing.
-4. Potential biases in the sources
-
-Findings so far:
+PRIOR FINDINGS (avoid duplicating these):
 {findings}
 
-Sources used:
-{source_urls}
+Your tasks:
+1. Extract 5-8 key findings from the sources combined.
+2. Identify 2-3 knowledge gaps or missing angles NOT covered by the sources.
+3. Note any contradictions or weak evidence.
 
-Return as JSON
+Return ONLY valid JSON, no markdown, no explanation:
 {{
-  "issues": [str],
-  "missing_perspectives": [str],
-  "knowledge_gaps": [str],
-  "overall_quality": float
+  "findings": [
+    {{
+      "claim": "specific factual claim",
+      "evidence": ["short quote or paraphrase supporting it"],
+      "source_urls": ["url of source"],
+      "confidence": 0.0-1.0,
+      "contradictions": []
+    }}
+  ],
+  "knowledge_gaps": ["gap 1", "gap 2"],
+  "critique_notes": ["note 1"],
+  "overall_quality": 0.0-1.0
 }}"""
