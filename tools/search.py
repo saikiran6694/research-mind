@@ -33,8 +33,7 @@ def web_search(query: str, max_results: int = 3) -> list[dict]:
     except Exception as e:
         print(f"[search] web_search error: {e}")
         return []
-
-
+      
 @tool
 def search_and_extract(query: str) -> list[dict]:
     """
@@ -60,3 +59,4 @@ def search_and_extract(query: str) -> list[dict]:
     except Exception as e:
         print(f"[search] search_and_extract error: {e}")
         return []
+
