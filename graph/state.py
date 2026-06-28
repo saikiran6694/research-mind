@@ -10,7 +10,7 @@ class ResearchState(TypedDict):
     # Orchestration
     messages:               Annotated[list, add_messages]
     iteration:              int
-    phase:                  str # planning | searching | scraping | analyzing | critiquing | synthesizing | done
+    phase:                  str # planning | searching | analyzing | synthesizing | done
 
 
     #Accumulated data

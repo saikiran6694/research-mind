@@ -1,75 +1,106 @@
 import json
-import os
-from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.messages import HumanMessage
+import re
+
+from models.schemas import Finding, ResearchReport, Source
 from graph.state import ResearchState
-from prompts.researchers import PLANNER_PROMPT, ANALYZER_PROMPT, CRITIQUE_PROMPT
+from prompts.researchers import PLANNER_PROMPT, ANALYZER_CRITIQUE_PROMPT
+
 from tools.search import search_and_extract
 from tools.scrapper import scrape_url
-from tools.validator import score_source_credibility
+from tools.validator import score_source_credibility, filter_sources
 from tools.vector_store import ingest_store, semantic_search
-from models.schemas import Source, ResearchReport
-load_dotenv()
 
-os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
+from utils.checkpoint import save_checkpoint
+from utils.rate_limiter import get_llm
+from utils.token_budget import (
+    MAX_SOURCES_PER_BATCH, NODE_BUDGETS, MAX_FINDINGS_IN_PROMPT, 
+    trim, trim_sources, build_sources_block, safe_json_list
+)
 
-model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2)
-model_structured = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+
+def _parse_json(text: str) -> dict | list:
+    """Strip markdown fences and parse JSON from an LLM response."""
+    text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
+    return json.loads(text)
 
 
-def _parse_json_response(response):
-    """Strip markdown code fences (if any) and parse the LLM response content as JSON."""
-    content = response.content.strip()
-    if content.startswith("```"):
-        content = content.strip("`")
-        if content.startswith("json"):
-            content = content[len("json"):]
-        content = content.strip()
-    return json.loads(content)
+def _depth_config(depth: str) -> dict:
+    return {
+        "shallow": {"max_queries": 3, "max_sources": 3, "max_iterations": 1},
+        "medium":  {"max_queries": 4, "max_sources": 5, "max_iterations": 2},
+        "deep":    {"max_queries": 5, "max_sources": 7, "max_iterations": 3},
+    }.get(depth, {"max_queries": 4, "max_sources": 5, "max_iterations": 2})
 
 
 def plan_searches(state: ResearchState) -> ResearchState:
     """Generate strategic search queries for the topic"""
 
     query = state['query']
-    prompt = PLANNER_PROMPT.format(
-        topic=query.topic,
-        focus_areas=", ".join(query.focus_areas) or "general",
-        existing_queries=state.get("search_queries", []),
-        knowledge_gaps=state.get("knowledge_gaps", [])
-    )
+    cfg = _depth_config(query.depth)
+    n = cfg['max_queries']
+    existing = state.get("search_queries", [])
+    gaps     = state.get("knowledge_gaps", [])
 
-    response = model.invoke([HumanMessage(content=prompt)])
+    prompt = trim(PLANNER_PROMPT.format(
+        n=n,
+        topic=query.topic,
+        focus_areas=", ".join(query.focus_areas) or "general overview",
+        existing_queries=json.dumps(existing[-6:] if existing else []),
+        knowledge_gaps=json.dumps(gaps) if gaps else []
+    ), NODE_BUDGETS['plan_searches'])
+
+    print(f"Planner Prompt: \n\n {prompt}\n\n")
+
+    model = get_llm()
+    response = model.invoke(prompt=prompt)
+
+    print(f"Planner Response:\n\n {response}\n\n")
     try:
-        queries = _parse_json_response(response)
+        queries = _parse_json(response)
+        if not isinstance(queries, list):
+            raise ValueError("Expected list")
     except Exception:
         queries = [query.topic] # fallback
 
-    return {
+    all_queries = existing + [q for q in queries if q not in existing]
+    
+    new_state = {
         **state,
         "phase": "searching",
-        "search_queries": state.get('search_queries', []) + queries,
+        "search_queries": all_queries,
         "messages": state.get("messages", []) + [response],
     }
+
+    save_checkpoint(topic=query.topic, completed_phase="searching", state=new_state)
+    return new_state
 
 
 def execute_searches(state: ResearchState) -> ResearchState:
     """Run searches and scrape content, storing to vector DB."""
-    new_queries = state['search_queries'][-5:]
+    query = state['query']
+    cfg = _depth_config(query.depth)
+    max_src = cfg['max_sources']
     raw_sources = list(state.get("raw_sources", []))
     seen_urls = {s['url'] for s in raw_sources}
 
-    for query_str in new_queries:
+    batch_size = _depth_config(query.depth)['max_queries']
+    recent_queries = state['search_queries'][-batch_size:]
+    
+    for query_str in recent_queries:
+        if len(raw_sources) >= max_src:
+            break
+
         results = search_and_extract.invoke({"query": query_str})
         for r in results:
+            if len(raw_sources) >= max_src:
+                break
             if r["url"] in seen_urls:
                 continue
             seen_urls.add(r["url"])
 
             # Scrape full content if raw content is short
             content = r.get('content', "")
-            if len(content) < 500:
+            if len(content) < 400:
                 scraped = scrape_url.invoke({"url": r["url"]})
                 if scraped['success']:
                     content = scraped['content']
@@ -83,154 +114,175 @@ def execute_searches(state: ResearchState) -> ResearchState:
                 "content_length": len(content)
             })
 
+            if cred_score < 0.35:
+                continue
+
             # Ingest into vector store
             chunk_ids = ingest_store(url=r["url"], title=r.get("title", ""), content=content)
 
             raw_sources.append({
                 "url": r["url"],
-                "title": r.get("title", ""),
+                "title": r.get("title", "Untitled"),
                 "content": content,
                 "credibility_score": cred_score,
                 "relevance_score": r.get("score", 0.5),
                 "chunk_ids": chunk_ids
             })
 
-    return {**state, "phase": "analyzing", "raw_sources": raw_sources}
+    new_state = {**state, "phase": "analyzing", "raw_sources": raw_sources}
+
+    save_checkpoint(query.topic, "analyzing", new_state)
+    return new_state
 
 
-def analyse_sources(state: ResearchState) -> ResearchState:
-    """Analyze each source to extract structured findings."""
-    findings = list(state.get('findings', []))
-    validated_sources: list[Source] = list(state.get('validated_sources', []))
-    analyzed_urls = {s['url'] for s in validated_sources}
+def analyse_and_critique(state: ResearchState) -> ResearchState:
+    """
+    Analyze each source to extract structured findings.
+    Critical review of findings to identify gaps and issues.
+    """
+    query = state['query']
+    sources = filter_sources(state.get("raw_sources", []))
 
-    for source in state.get("raw_sources", []):
-        if source['url'] in analyzed_urls:
-            continue
+    trimmed = trim_sources(sources=sources, max_sources=MAX_SOURCES_PER_BATCH)
+    
+    kb_docs    = semantic_search(query.topic, k=3)
+    kb_context = "\n".join(d.page_content for d in kb_docs)[:600]
 
-        if source['credibility_score'] < 0.3:
-            continue
+    source_block = build_sources_block(sources=trimmed)
 
-        # Pull relevant context from the vector store, excluding this source's own chunks
-        kb_docs = semantic_search(query=state['query'].topic, k=8)
-        kb_docs = [d for d in kb_docs if d.metadata.get("url") != source['url']][:4]
-        kb_context = "\n\n".join([d.page_content.strip() for d in kb_docs])
+    prior_findings = safe_json_list(state.get("findings", []), MAX_FINDINGS_IN_PROMPT)
 
-        prompt = ANALYZER_PROMPT.format(
-            topic=state['query'].topic,
-            url=source['url'],
-            title=source['title'],
-            content=source['content'][:3000],
-            kb_context=kb_context[:1500]
-        )
-
-        response = model.invoke([HumanMessage(content=prompt)])
-        try:
-            analysis = _parse_json_response(response)
-        except Exception:
-            continue
-
-        for f in analysis.get('findings', []):
-            findings.append({
-                "claim": f["claim"],
-                "evidence": f.get("evidence", []),
-                "source_urls": [source["url"]],
-                "confidence": f.get('confidence', 0.5),
-                "contradictions": f.get("contradictions", [])
-            })
-
-        source['relevance_score'] = analysis.get("relevance_score", source['relevance_score'])
-        validated_sources.append(source)
-
-    return { 
-        **state, 
-        "phase": "critiquing", 
-        "findings": findings, 
-        "validated_sources": validated_sources 
-    }
-
-
-def critique_findings(state: ResearchState) -> ResearchState:
-    """Critical review of findings to identify gaps and issues."""
-    findings = json.dumps(state['findings'][:20], indent=2)
-    source_urls = [s['url'] for s in state['validated_sources']]
-
-    prompt = CRITIQUE_PROMPT.format(
-        findings=findings,
-        source_urls=source_urls
+    prompt = trim(
+        ANALYZER_CRITIQUE_PROMPT.format(
+            topic=query.topic,
+            focus_areas=', '.join(query.focus_areas) or 'general',
+            kb_context=kb_context,
+            sources_block=source_block,
+            findings=json.dumps(prior_findings),
+        ), NODE_BUDGETS['analyze_and_critique']
     )
 
-    response = model.invoke([HumanMessage(content=prompt)])
+    model = get_llm()
+    response = model.invoke(prompt=prompt)
+
     try:
-        critique = _parse_json_response(response)
-    except Exception:
-        critique = {"issues": [], "missing_perspectives": [], "knowledge_gaps": [], "overall_quality": 0.6}
+        data = _parse_json(response)
+        new_findings = data.get("findings", [])
+        gaps         = data.get("knowledge_gaps", [])
+        critique     = data.get("critique_notes", [])
+    except Exception as e:
+        print(f"[analyze_and_critique] JSON parse failed: {e}")
+        new_findings = []
+        gaps         = []
+        critique     = []
 
-    gaps = critique.get("knowledge_gaps", []) + critique.get("missing_perspectives", [])
+    # Merge with existing findings (dedup by claim)
+    existing_claims = {f["claim"] for f in state.get("findings", [])}
+    merged_findings = list(state.get("findings", []))
+    for f in new_findings:
+        if f.get("claim") not in existing_claims:
+            merged_findings.append(f)
+            existing_claims.add(f.get("claim"))
 
-    return {
+    new_state = {
         **state,
-        "phase": "synthesizing",
-        "knowledge_gaps": gaps,
-        "critique_notes": critique.get("issues", []),
-        "iteration": state.get("iteration", 0) + 1,
-        "messages": state["messages"] + [response]
+        "phase":             "synthesizing",
+        "findings":          merged_findings,
+        "knowledge_gaps":    gaps,
+        "critique_notes":    critique,
+        "validated_sources": filter_sources(state["raw_sources"]),
+        "iteration":         state.get("iteration", 0) + 1,
     }
+
+    save_checkpoint(topic=query.topic, completed_phase="synthesizing", state=new_state)
+    return new_state
+
     
 def synthesize_report(state: ResearchState) -> ResearchState:
     """Generate the final structured research report."""
-    context = {
-        "topic": state["query"].topic,
-        "findings_count": len(state["findings"]),
-        "sources_count": len(state["validated_sources"]),
-        "findings": state["findings"][:25],
-        "gaps": state["knowledge_gaps"],
-        "critique": state["critique_notes"]
-    }
 
-    prompt = f"""You are a senior research analyst. Synthesize the following research into a 
-comprehensive, well-structured report.
+    query    = state["query"]
+    findings = safe_json_list(state.get("findings", []), MAX_FINDINGS_IN_PROMPT)
+    gaps = state.get("knowledge_gaps", [])
+    critique = state.get("critique_notes", [])
+    sources = state.get("validated_sources", state.get("raw_sources", []))
 
-Research Context:
-{json.dumps(context, indent=2)}
+    source_urls = [s["url"] for s in sources[:8]]
 
-Produce a report with:
-1. Executive Summary (2-3 paragraphs)
-2. Key Findings (consolidated, de-duplicated, with confidence levels)
-3. Areas of Consensus vs Controversy
-4. Knowledge Gaps & Limitations
-5. Recommended Follow-up Queries
+    prompt = trim(
+        f"""You are a senior research analyst. Synthesise these research findings into
+a structured report.
 
-Return as JSON matching ResearchReport schema:
+TOPIC: {query.topic}
+
+KEY FINDINGS:
+{json.dumps(findings, indent=2)}
+
+KNOWLEDGE GAPS: {json.dumps(gaps)}
+CRITIQUE NOTES: {json.dumps(critique)}
+SOURCES USED: {json.dumps(source_urls)}
+
+Write a comprehensive research report. Return ONLY valid JSON:
 {{
-  "topic": str,
-  "summary": str,
-  "key_findings": [{{"claim": str, "evidence": [str], "source_urls": [str], "confidence": float, "contradictions": [str]}}],
-  "gaps_identified": [str],
-  "follow_up_queries": [str],
-  "confidence_overall": float
-}}"""
+  "topic": "{query.topic}",
+  "summary": "3-4 paragraph executive summary",
+  "key_findings": [
+    {{
+      "claim": "consolidated finding",
+      "evidence": ["supporting evidence"],
+      "source_urls": ["url"],
+      "confidence": 0.0-1.0,
+      "contradictions": []
+    }}
+  ],
+  "gaps_identified": ["gap 1", "gap 2"],
+  "follow_up_queries": ["query 1", "query 2", "query 3"],
+  "confidence_overall": 0.0-1.0
+}}""",
+        NODE_BUDGETS["synthesize_report"],
+    )
     
-    response = model.invoke([HumanMessage(content=prompt)])
+    model = get_llm()
+    response = model.invoke(prompt=prompt)
+    
+    report = None
     try:
-        report_data = _parse_json_response(response)
-        report_data["sources"] = state["validated_sources"]
-        report_data["word_count"] = len(report_data["summary"].split())
-        report = ResearchReport(**report_data)
+        data = _parse_json(response)
+        data["sources"]    = [Source(**s) for s in sources[:10]]
+        data["word_count"] = len(data.get("summary", "").split())
+        report = ResearchReport(**data)
     except Exception as e:
-        report = None
+        print(f"[synthesize_report] Failed to parse report: {e}")
+        # Minimal fallback report
+        report = ResearchReport(
+            topic=query.topic,
+            summary=f"Research on '{query.topic}' completed with "
+                    f"{len(state.get('findings', []))} findings.",
+            key_findings=[
+                Finding(**f) for f in state.get("findings", [])[:5]
+            ],
+            gaps_identified=gaps,
+            follow_up_queries=[],
+            confidence_overall=0.4,
+        )
 
-    return {**state, "phase": "done", "report": report}
+    new_state = {**state, "phase": "done", "report": report}
+    
+    save_checkpoint(topic=query.topic,completed_phase="done",state=new_state)
+    return new_state
 
 
 def should_loop_back(state: ResearchState) -> str:
     """After critique, decide whether to search more or synthesize."""
-    depth = state['query'].depth
+    cfg       = _depth_config(state["query"].depth)
+    max_iter  = cfg["max_iterations"]
     iteration = state.get("iteration", 0)
-    gaps = state.get("knowledge_gaps", [])
+    gaps      = state.get("knowledge_gaps", [])
 
-    max_iterations = {"shallow": 1, "medium": 2, "deep": 3}[depth]
+    if iteration < max_iter and len(gaps) > 0:
+        print(f"[Router] Looping back — iteration {iteration}/{max_iter}, "
+              f"{len(gaps)} gaps found.")
+        return "plan_searches"
 
-    if iteration < max_iterations and len(gaps) > 0:
-        return "plan_searches" # loop back to fill gaps
+    print(f"[Router] Moving to synthesis — iteration {iteration}/{max_iter}.")
     return "synthesize_report"

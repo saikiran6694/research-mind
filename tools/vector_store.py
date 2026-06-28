@@ -36,7 +36,10 @@ def ingest_store(url: str, title: str, content: str) -> list[str]:
 
 def semantic_search(query: str, k: int = 6) -> list[Document]:
     """Retrieve most relevant chunks for a query."""
-    return _store.similarity_search(query=query, k=k)
-
+    try:
+        return _store.similarity_search(query=query, k=k)
+    except Exception:
+        return []
+    
 def get_store() -> Chroma:
     return _store
