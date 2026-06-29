@@ -102,6 +102,16 @@ python main.py --list-checkpoints
 
 This streams progress to the terminal (via `rich`), then prints a rendered summary table (sources, findings, confidence, word count, LLM calls used) and writes the full report to `report_<topic>.json`.
 
+## Web UI
+
+For users who'd rather not use the CLI, `app.py` provides a Streamlit interface over the same research graph:
+
+```bash
+streamlit run app.py
+```
+
+Enter a topic, pick a depth, optionally add focus areas, and click "Start research." Progress streams live in the page, and the finished report renders as an expandable findings list, knowledge gaps, follow-up queries, and sources, with a JSON download button. Saved checkpoints are listed in the sidebar.
+
 ## Tech stack
 
 - **Orchestration**: LangGraph (`langgraph`)
