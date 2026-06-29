@@ -13,3 +13,4 @@ pydantic
 python-dotenv
 rich
 tiktoken
+streamlit
