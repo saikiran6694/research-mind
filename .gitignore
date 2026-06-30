@@ -17,5 +17,8 @@ wheels/
 
 # Project data & generated output
 chroma_db/
+.claude/
 report_*.json
 *.log
+.pytest_cache
+.daily_file.json
