@@ -254,15 +254,20 @@ Write a comprehensive research report. Return ONLY valid JSON:
     except Exception as e:
         print(f"[synthesize_report] Failed to parse report: {e}")
         # Minimal fallback report
+        fallback_summary = (
+            f"Research on '{query.topic}' completed with "
+            f"{len(state.get('findings', []))} findings."
+        )
         report = ResearchReport(
             topic=query.topic,
-            summary=f"Research on '{query.topic}' completed with "
-                    f"{len(state.get('findings', []))} findings.",
+            summary=fallback_summary,
             key_findings=[
                 Finding(**f) for f in state.get("findings", [])[:5]
             ],
+            sources=[Source(**s) for s in sources[:10]],
             gaps_identified=gaps,
             follow_up_queries=[],
+            word_count=len(fallback_summary.split()),
             confidence_overall=0.4,
         )
 
